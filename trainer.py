@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+import wandb
 
 import dist
 from models import VAR, VQVAE, VectorQuantizer2
@@ -50,6 +51,20 @@ class VARTrainer(object):
         self.prog_it = 0
         self.last_prog_si = -1
         self.first_prog = True
+        
+        # Initialize wandb (only on master process)
+        if dist.is_master():
+            wandb.init(
+                project="VAR",
+                name="d16_256x256",
+                config={
+                    "patch_nums": patch_nums,
+                    "resolutions": resos,
+                    "label_smooth": label_smooth,
+                    "vocab_size": vae_local.vocab_size,
+                    "device": str(device),
+                }
+            )
     
     @torch.no_grad()
     def eval_ep(self, ld_val: DataLoader):
@@ -81,6 +96,18 @@ class VARTrainer(object):
         tot = round(stats[-1].item())
         stats /= tot
         L_mean, L_tail, acc_mean, acc_tail, _ = stats.tolist()
+        
+        # Log validation metrics to wandb
+        if dist.is_master():
+            wandb.log({
+                "val/loss_mean": L_mean,
+                "val/loss_tail": L_tail,
+                "val/acc_mean": acc_mean,
+                "val/acc_tail": acc_tail,
+                "val/total_samples": tot,
+                "val/eval_time": time.time()-stt
+            })
+        
         return L_mean, L_tail, acc_mean, acc_tail, tot, time.time()-stt
     
     def train_step(
@@ -134,6 +161,28 @@ class VARTrainer(object):
                 acc_tail = (pred_BL[:, -self.last_l:] == gt_BL[:, -self.last_l:]).float().mean().item() * 100
             grad_norm = grad_norm.item()
             metric_lg.update(Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm)
+            
+            # Log training metrics to wandb
+            if dist.is_master():
+                wandb_log_dict = {
+                    "train/loss": loss.item(),
+                    "train/loss_mean": Lmean,
+                    "train/acc_mean": acc_mean,
+                    "train/grad_norm": grad_norm,
+                    "train/learning_rate": self.var_opt.optimizer.param_groups[0]['lr'],
+                    "train/prog_si": prog_si,
+                    "train/prog_wp": prog_wp,
+                    "train/global_step": g_it,
+                }
+                if prog_si < 0:  # not in progressive training
+                    wandb_log_dict.update({
+                        "train/loss_tail": Ltail,
+                        "train/acc_tail": acc_tail,
+                    })
+                # Add scale info if using mixed precision
+                if scale_log2 is not None:
+                    wandb_log_dict["train/scale_log2"] = scale_log2
+                wandb.log(wandb_log_dict, step=g_it)
         
         # log to tensorboard
         if g_it == 0 or (g_it + 1) % 500 == 0:
@@ -146,6 +195,10 @@ class VARTrainer(object):
                     tb_lg.update(head='AR_iter_loss', z_voc_usage=cluster_usage, step=-10000)
                     tb_lg.update(head='AR_iter_loss', z_voc_usage=cluster_usage, step=-1000)
                 kw = dict(z_voc_usage=cluster_usage)
+                wandb_detailed_log = {
+                    "train/vocab_usage": cluster_usage,
+                    "train/prog_a_reso": self.resos[prog_si] if prog_si >= 0 else -1,
+                }
                 for si, (bg, ed) in enumerate(self.begin_ends):
                     if 0 <= prog_si < si: break
                     pred, tar = logits_BLV.data[:, bg:ed].reshape(-1, V), gt_BL[:, bg:ed].reshape(-1)
@@ -153,8 +206,14 @@ class VARTrainer(object):
                     ce = self.val_loss(pred, tar).item()
                     kw[f'acc_{self.resos[si]}'] = acc
                     kw[f'L_{self.resos[si]}'] = ce
+                    # Add to wandb logging
+                    wandb_detailed_log[f'train/acc_{self.resos[si]}'] = acc
+                    wandb_detailed_log[f'train/loss_{self.resos[si]}'] = ce
                 tb_lg.update(head='AR_iter_loss', **kw, step=g_it)
                 tb_lg.update(head='AR_iter_schedule', prog_a_reso=self.resos[prog_si], prog_si=prog_si, prog_wp=prog_wp, step=g_it)
+                
+                # Log detailed metrics to wandb
+                wandb.log(wandb_detailed_log, step=g_it)
         
         self.var_wo_ddp.prog_si = self.vae_local.quantize.prog_si = -1
         return grad_norm, scale_log2
