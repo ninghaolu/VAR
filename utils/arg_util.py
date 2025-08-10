@@ -23,7 +23,7 @@ import dist
 
 
 class Args(Tap):
-    data_path: str = '/vast/work/public/ml-datasets/imagenet'
+    data_path: str = '/vast/nl2752/imagenet'
     exp_name: str = 'text'
     
     # VAE
